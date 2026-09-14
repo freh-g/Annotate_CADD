@@ -6,13 +6,40 @@ Input  : training_sets/<EFO>_training.tsv
          columns: chrom pos rsid effect_allele efo study locus
                   beta p_value z beta_sign pip label pip_target
 Output : annotated/<EFO>_training.tsv_annotated.tsv
-         same columns + CADD_Ref CADD_Alt + all CADD feature columns
+         same columns + CADD_hit_index + CADD_Ref CADD_Alt + all CADD
+         feature columns
 
 Matching
     alt_only (default)  chrom + pos + ALT == effect_allele
     ref_alt             chrom + pos + REF + ALT   (needs a real REF column)
 
 The training set has no REF column, so alt_only is the correct mode.
+
+MULTI-HIT VARIANTS -- KEEPS ALL ROWS (does not take-first)
+    CADD reports one row per overlapping transcript, so ~32% of variants in
+    this pipeline return more than one row for the same chrom/pos/ALT. The
+    site-level features (conservation, chromatin, GERP, etc.) are identical
+    across those rows; the transcript-specific ones (Consequence, GeneID,
+    Exon, cDNApos, oAA/nAA, etc.) genuinely differ per transcript and are
+    NOT interchangeable -- keeping only the first, as the previous version
+    of this script did, silently discards whichever other transcripts also
+    overlapped that position (e.g. a variant missense in one transcript but
+    intronic in another).
+
+    This version instead EXPANDS each matched input row into one output row
+    PER matching CADD transcript hit, all carrying the same original data
+    (chrom, pos, beta, etc.) but each with its own CADD_Ref/CADD_Alt/feature
+    columns. A new `CADD_hit_index` column (0-based) is added so rows
+    originating from the same input variant can be grouped back together
+    downstream (e.g. `groupby(['chrom','pos','effect_allele','study'])`).
+
+    This means: (a) matched/total in the summary now refers to INPUT rows,
+    not output rows -- a single matched input row can produce several output
+    rows; (b) any downstream script doing per-row analysis (recall@k,
+    region-grouped CV, etc.) must decide how to handle the resulting
+    duplicates -- e.g. collapse back to one row per variant (as the
+    previous take-first behaviour did) at the point where it matters,
+    or explicitly treat transcript-level annotation as its own axis.
 
 Usage
     python 11_annotate_parallel.py \
@@ -31,9 +58,9 @@ from collections import defaultdict
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--input-dir",  default="../training_sets/")
-    p.add_argument("--pattern",    default="*_training.tsv",
+    p.add_argument("--pattern",    default="*training*",
                    help="only files matching this are annotated")
-    p.add_argument("--tabix",  required = True)
+    p.add_argument("--tabix",  required=True,help="path of the CADD tabix file")
     p.add_argument("--output-dir", default="../annotated/")
     p.add_argument("--tabix-header", default=None)
     p.add_argument("--match-mode", choices=["alt_only", "ref_alt"],
@@ -78,10 +105,30 @@ def tabix_contigs(tabix_path):
 CADD_CHROM, CADD_POS, CADD_REF, CADD_ALT = 0, 1, 2, 3
 
 
+def match_hits(hits, pos, alt, ref, match_mode):
+    """
+    Pure matching logic, factored out of process_chunk so it can be unit
+    tested without a real tabix file. Returns a list of matched CADD rows
+    (each a list of fields split on tab) -- ALL matches, not just the first.
+    """
+    found = []
+    for hit in hits:
+        hf = hit.split("\t") if isinstance(hit, str) else hit
+        if int(hf[CADD_POS]) != pos:
+            continue
+        if hf[CADD_ALT].upper() != alt:
+            continue
+        if match_mode == "ref_alt" and hf[CADD_REF].upper() != ref:
+            continue
+        found.append(hf)
+    return found
+
+
 def process_chunk(task):
     """
     Annotate one chromosome's worth of UNIQUE variant keys.
-    Returns {key: [CADD_Ref, CADD_Alt, *features]}
+    Returns {key: [[CADD_Ref, CADD_Alt, *features], ...]}  -- a LIST of
+    matches per key, not a single row.
     """
     (keys, chrom_tag, contig, tabix_path, tabix_header_path,
      match_mode) = task
@@ -104,28 +151,20 @@ def process_chunk(task):
         except ValueError:
             continue
 
-        found = []
-        for hit in hits:
-            hf = hit.split("\t")
-            if int(hf[CADD_POS]) != pos:
-                continue
-            if hf[CADD_ALT].upper() != alt:
-                continue
-            if match_mode == "ref_alt" and hf[CADD_REF].upper() != ref:
-                continue
-            found.append(hf)
-
+        found = match_hits(hits, pos, alt, ref, match_mode)
         if not found:
             continue
         if len(found) > 1:
             multi += 1
 
-        hf    = found[0]
-        feats = hf[4:]
-        # pad/trim ragged rows so every output line has the same width
-        if len(feats) != n_extra:
-            feats = (feats + [""] * n_extra)[:n_extra]
-        ann[key] = [hf[CADD_REF], hf[CADD_ALT]] + feats
+        rows = []
+        for hf in found:
+            feats = hf[4:]
+            # pad/trim ragged rows so every output line has the same width
+            if len(feats) != n_extra:
+                feats = (feats + [""] * n_extra)[:n_extra]
+            rows.append([hf[CADD_REF], hf[CADD_ALT]] + feats)
+        ann[key] = rows
 
     tb.close()
     return ann, multi, chrom_tag
@@ -142,7 +181,7 @@ def annotate_file(in_file, out_file, args, contig_map, n_extra, extra_cols):
 
     if not lines:
         print("  empty file, skipping", file=sys.stderr)
-        return 0, 0, 0
+        return 0, 0, 0, 0
 
     # ── collect UNIQUE variant keys per chromosome ───────────────────────────
     # the same variant appears once per study, so this avoids repeat lookups
@@ -188,12 +227,15 @@ def annotate_file(in_file, out_file, args, contig_map, n_extra, extra_cols):
                 total_multi += multi
 
     # ── write annotated + unmatched, preserving input row order ──────────────
-    out_header = list(header)
+    # one output row PER matching CADD transcript hit -- CADD_hit_index lets
+    # you regroup back to the original variant downstream.
+    out_header = list(header) + ["CADD_hit_index"]
     if not args.no_keep_ref_alt:
         out_header += ["CADD_Ref", "CADD_Alt"]
     out_header += extra_cols
 
-    matched  = 0
+    matched_rows   = 0   # INPUT rows that matched at least one CADD hit
+    output_rows    = 0   # total OUTPUT lines written (>= matched_rows)
     unm_path = out_file.replace("_annotated.tsv", "_unmatched.tsv")
     fu = open(unm_path, "w") if args.unmatched else None
     if fu:
@@ -202,20 +244,23 @@ def annotate_file(in_file, out_file, args, contig_map, n_extra, extra_cols):
     with open(out_file, "w") as fo:
         fo.write("\t".join(out_header) + "\n")
         for ln, key in zip(lines, row_keys):
-            rec = ann.get(key)
-            if rec is None:
+            hit_rows = ann.get(key)
+            if not hit_rows:
                 if fu:
                     fu.write(ln + "\n")
                 continue
-            fields = ln.split("\t")
-            fields += rec if not args.no_keep_ref_alt else rec[2:]
-            fo.write("\t".join(fields) + "\n")
-            matched += 1
+            matched_rows += 1
+            base_fields = ln.split("\t")
+            for hit_idx, rec in enumerate(hit_rows):
+                fields = list(base_fields) + [str(hit_idx)]
+                fields += rec if not args.no_keep_ref_alt else rec[2:]
+                fo.write("\t".join(fields) + "\n")
+                output_rows += 1
 
     if fu:
         fu.close()
 
-    return matched, len(lines), total_multi
+    return matched_rows, len(lines), total_multi, output_rows
 
 
 def main():
@@ -249,8 +294,11 @@ def main():
     print(f"Match mode: {args.match_mode}   CADD feature columns: {n_extra}",
           file=sys.stderr)
     print(f"Tabix contigs look like: {sorted(contigs)[:3]} ...", file=sys.stderr)
+    print("NOTE: this version keeps ALL matching CADD rows per variant "
+          "(one output row per transcript hit), not just the first. "
+          "See CADD_hit_index in the output.", file=sys.stderr)
 
-    grand_matched = grand_total = grand_multi = 0
+    grand_matched = grand_total = grand_multi = grand_output = 0
     wall_start = time.time()
 
     for in_file in input_files:
@@ -259,16 +307,17 @@ def main():
         print(f"\n> {base}", file=sys.stderr)
         t0 = time.time()
 
-        matched, total, multi = annotate_file(
+        matched, total, multi, out_rows = annotate_file(
             in_file, out_file, args, contig_map, n_extra, extra_cols)
 
         elapsed = int(time.time() - t0)
         pct = 100 * matched / total if total else 0
-        print(f"  {matched:,}/{total:,} matched ({pct:.1f}%) in {elapsed}s "
-              f"-> {out_file}", file=sys.stderr)
+        print(f"  {matched:,}/{total:,} input rows matched ({pct:.1f}%) "
+              f"-> {out_rows:,} output rows in {elapsed}s -> {out_file}",
+              file=sys.stderr)
         if multi:
-            print(f"  {multi:,} sites had >1 CADD row for that ALT (kept first)",
-                  file=sys.stderr)
+            print(f"  {multi:,} variants had >1 CADD row (ALL kept, "
+                  f"expanded into separate output rows)", file=sys.stderr)
         if args.unmatched and matched < total:
             print(f"  unmatched -> "
                   f"{out_file.replace('_annotated.tsv', '_unmatched.tsv')}",
@@ -277,16 +326,19 @@ def main():
         grand_matched += matched
         grand_total   += total
         grand_multi   += multi
+        grand_output  += out_rows
 
     elapsed = int(time.time() - wall_start)
     h, r = divmod(elapsed, 3600)
     m, s = divmod(r, 60)
     pct = 100 * grand_matched / grand_total if grand_total else 0
     print(f"\nAll done in {h}h {m}m {s}s. "
-          f"{grand_matched:,}/{grand_total:,} matched ({pct:.1f}%).",
-          file=sys.stderr)
+          f"{grand_matched:,}/{grand_total:,} input rows matched ({pct:.1f}%), "
+          f"{grand_output:,} total output rows.", file=sys.stderr)
     if grand_multi:
-        print(f"{grand_multi:,} multi-hit sites overall.", file=sys.stderr)
+        print(f"{grand_multi:,} multi-hit variants overall "
+              f"(expanded to {grand_output - grand_matched:,} extra rows).",
+              file=sys.stderr)
 
 
 if __name__ == "__main__":

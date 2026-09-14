@@ -1,18 +1,18 @@
-Annotates GWAS training-set variants with **CADD** features by doing fast,
-indexed lookups into a bgzipped, tabix-indexed whole-genome CADD file. It runs
-one worker per chromosome in parallel.
+# CADD Annotation Pipeline
 
-## Input / Output
+## `annotate.py` — annotate with CADD
 
-| | Path | Columns |
-|---|---|---|
-| **Input** | `training_sets/<EFO>_training.tsv` | `chrom pos rsid effect_allele efo study locus beta p_value z beta_sign pip label pip_target` |
-| **Output** | `annotated/<EFO>_training.tsv_annotated.tsv` | same columns **+** `CADD_Ref CADD_Alt` **+** every CADD feature column|
-| **Reference** | `whole_genome_SNVs_inclAnno.tsv.gz` | tabix-indexed CADD table laid out as `Chrom Pos Ref Alt <features…>` available here: https://krishna.gs.washington.edu/download/CADD/v1.7/GRCh38/whole_genome_SNVs_inclAnno.tsv.gz |
+Matches each variant against CADD's `whole_genome_SNVs_inclAnno.tsv.gz` (available at https://krishna.gs.washington.edu/download/CADD/v1.7/GRCh38/whole_genome_SNVs_inclAnno.tsv.gz) via
+tabix, on `chrom + pos + ALT`.
 
-Optionally also writes a `<EFO>_training.tsv_unmatched.tsv` holding the input
-rows that found no CADD match (`--unmatched`).
- 
+```bash
+python 11_annotate_parallel.py \
+    --input-dir  ../training_sets/ \
+    --output-dir ../annotated/ \
+    --pattern '*_training.tsv' \
+    --unmatched
+```
+
 ## Input column requirements
 
 The script locates input columns **by position, not by name**. The header row
@@ -44,53 +44,11 @@ Consequences:
   nothing; position is what's used.
 - **Everything after the matched columns**, is never inspected — it's carried straight through to the output.
 
-## Matching modes
 
-- **`alt_only`** (default) — matches on `chrom + pos + ALT`, where `ALT` is the
-  training set's `effect_allele`. This is the correct mode here because the
-  training set has **no REF column**.
-- **`ref_alt`** — matches on `chrom + pos + REF + ALT`; requires a real REF
-  column supplied via `--ref-col`.
-
-## How it works
-
-1. **Read CADD metadata once** (`main`): grabs the CADD header to learn the
-   feature columns, and reads the set of contig names from the tabix index.
-2. **Normalize chromosome names**: builds a `contig_map` so bare names like `1`
-   or `X` map onto whatever the index actually uses (`1` vs `chr1`, `MT` vs
-   `M`, etc.).
-3. **Per input file** (`annotate_file`):
-   - Reads all rows and collects **unique** variant keys per chromosome. The
-     same variant appears once per study, so de-duplicating avoids repeated
-     tabix lookups.
-   - Builds one task per chromosome; warns and skips any chromosome absent from
-     the index.
-   - Fans the tasks out over a multiprocessing `Pool` (one chromosome per
-     worker), with a `tqdm` progress bar.
-4. **Per chromosome** (`process_chunk`): opens the tabix file, `fetch`es the CADD
-   rows at each position, and keeps rows whose `Pos` and `Alt` (and `Ref` in
-   `ref_alt` mode) match. If a variant has more than one CADD row it keeps the
-   first and increments a multi-hit counter. Feature lists are padded/trimmed to
-   a fixed width so the output stays rectangular even with ragged source rows.
-5. **Write output** (`annotate_file`): re-joins the annotations back to the
-   original lines **in input order**, appends `CADD_Ref`/`CADD_Alt` (unless
-   `--no-keep-ref-alt`) plus the feature columns, and routes unmatched rows to
-   the unmatched file.
-6. **Summary** (`main`): prints per-file and grand-total matched counts,
-   percentages, multi-hit counts, and wall-clock time.
-
-## Key functions
-
-- **`get_tabix_header`** — resolves the CADD column header, trying, in order: an
-  explicit header file, the tabix embedded header (last header line), then the
-  first line of the uncompressed file.
-- **`tabix_contigs`** — returns the set of contigs in the tabix index.
-- **`process_chunk`** — the parallel worker; annotates one chromosome's unique
-  keys and returns `{key: [CADD_Ref, CADD_Alt, *features]}`.
-- **`annotate_file`** — orchestrates de-duplication, task creation, the worker
-  pool, and ordered output for a single file.
-- **`main`** — globs inputs, loads CADD metadata, builds the contig map, loops
-  over files, and reports totals.
+| flag | default | notes |
+|---|---|---|
+| `--match-mode` | `alt_only` | use `ref_alt` only if your input has a real REF column |
+| `--unmatched` | off | also writes `*_unmatched.tsv` for variants with no CADD hit |
 
 ## Command-line arguments
 
@@ -119,3 +77,9 @@ python 11_annotate_parallel.py \
     --pattern '*_training.tsv' \
     --unmatched
 ```
+
+
+**Output:** `<file>_annotated.tsv` — original columns + `CADD_hit_index` +
+`CADD_Ref`/`CADD_Alt` + all CADD feature columns. Row count ≥ input row count.
+
+
