@@ -5,13 +5,6 @@
 Matches each variant against CADD's `whole_genome_SNVs_inclAnno.tsv.gz` (available at https://krishna.gs.washington.edu/download/CADD/v1.7/GRCh38/whole_genome_SNVs_inclAnno.tsv.gz) via
 tabix, on `chrom + pos + ALT`.
 
-```bash
-python 11_annotate_parallel.py \
-    --input-dir  ../training_sets/ \
-    --output-dir ../annotated/ \
-    --pattern '*_training.tsv' \
-    --unmatched
-```
 
 ## Input column requirements
 
@@ -70,7 +63,7 @@ Consequences:
 ## Example usage
 
 ```bash
-python 11_annotate_parallel.py \
+python annotate.py \
     --input-dir  folder/to/the/files/to/annotate \
     --tabix /path/to/CADD/annotation/file \ 
     --output-dir ../annotated/ \
